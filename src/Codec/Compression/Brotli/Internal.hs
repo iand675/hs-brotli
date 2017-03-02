@@ -17,7 +17,7 @@ defaultQuality = 11
 defaultWindow = 22
 defaultMode = encoderModeGeneric
 
-newtype BrotliEncoderMode = BrotliEncoderMode CInt
+newtype BrotliEncoderMode = BrotliEncoderMode { fromBrotliEncoderMode :: CInt }
   deriving (Show)
 
 encoderModeGeneric = BrotliEncoderMode 0
@@ -50,7 +50,7 @@ foreign import ccall unsafe "BrotliEncoderCreateInstance" brotliEncoderCreateIns
 createEncoder :: IO BrotliEncoderState
 createEncoder = brotliEncoderCreateInstance nullFunPtr nullFunPtr nullPtr
 
-foreign import ccall unsafe "BrotliEncoderSetParameter" setParameter
+foreign import ccall unsafe "BrotliEncoderSetParameter" encoderSetParameter
   :: BrotliEncoderState
   -> BrotliEncoderParameter
   -> Word32

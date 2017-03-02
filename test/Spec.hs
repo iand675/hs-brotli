@@ -12,18 +12,19 @@ import Test.QuickCheck.Instances
 main :: IO ()
 main = do
   putStrLn ""
-  bs <- L.readFile "/usr/share/dict/words"
-  print $ L.take 1 $ compress bs
   {-
+  bs <- L.readFile "/usr/share/dict/words"
+  print $ (compressWith bs (defaultCompressionSettings { compressionQuality = 0 }) :: L.ByteString)
+
   quickCheck $ \bs ->
     let cbs = (compress (bs :: B.ByteString)) :: B.ByteString
         dbs = (decompress cbs) :: B.ByteString
     in dbs == bs
+  -}
   quickCheck $ \bs ->
     let cbs = (compress (bs :: L.ByteString)) :: L.ByteString
         dbs = (decompress cbs) :: L.ByteString
     in dbs == bs
-  -}
   {-
   needsOutputL
   let comped = compress f

@@ -1,8 +1,9 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE MultiParamTypeClasses  #-}
 {-# LANGUAGE MagicHash              #-}
+{-# LANGUAGE RecordWildCards        #-}
 module Codec.Compression.Brotli where
-import Control.Monad (when, unless)
+import Control.Monad (when, unless, forM)
 import Control.Exception (bracket)
 import qualified Codec.Compression.Brotli.Internal as I
 import qualified Data.ByteString as B
@@ -10,27 +11,65 @@ import qualified Data.ByteString.Unsafe as B
 import qualified Data.ByteString.Internal as BI
 import qualified Data.ByteString.Lazy as L
 import qualified Data.ByteString.Lazy.Internal as LI
+import Data.Maybe (catMaybes)
 import Data.IORef
 import Data.Int
+import Data.Word
 import Foreign.C
-import Foreign.Ptr (castPtr, nullPtr)
-import Foreign.Marshal (alloca, allocaBytes)
-import Foreign.Storable (peek, poke)
+import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
+import Foreign.Marshal (alloca, allocaBytes, mallocBytes, free)
+import Foreign.Storable (sizeOf, peek, poke)
 import GHC.Int
 import GHC.Types
 import System.IO.Unsafe
 
+data CompressionSettings = CompressionSettings
+  { compressionQuality :: !Word32
+  , compressionWindow :: !Word32
+  , compressionMode :: !I.BrotliEncoderMode
+  , compressionBufferSize :: !Int
+  , compressionBlockSize :: !(Maybe Word32)
+  , compressionDisableLiteralContextModeling :: !(Maybe Word32)
+  , compressionSizeHint :: !(Maybe Word32)
+  }
+
+defaultCompressionSettings :: CompressionSettings
+defaultCompressionSettings = CompressionSettings
+  { compressionQuality = I.defaultQuality
+  , compressionWindow = I.defaultWindow
+  , compressionMode = I.defaultMode
+  , compressionBufferSize = (16 * 1024) - LI.chunkOverhead
+  , compressionBlockSize = Nothing
+  , compressionDisableLiteralContextModeling = Nothing
+  , compressionSizeHint = Nothing
+  }
+
+setCompressionSettings :: I.BrotliEncoderState -> CompressionSettings -> IO ()
+setCompressionSettings st CompressionSettings{..}= do
+  r1 <- I.encoderSetParameter st I.mode $ fromIntegral $ I.fromBrotliEncoderMode compressionMode
+  r2 <- I.encoderSetParameter st I.quality compressionQuality
+  r3 <- I.encoderSetParameter st I.lz77WindowSize compressionWindow
+  mr4 <- forM compressionBlockSize $ I.encoderSetParameter st I.lz77BlockSize
+  mr5 <- forM compressionDisableLiteralContextModeling $ I.encoderSetParameter st I.disableLiteralContextModeling
+  mr6 <- forM compressionSizeHint $ I.encoderSetParameter st I.brotliParamSizeHint
+  if any (/= 1) $ r1 : r2 : r3 : catMaybes [mr4, mr5, mr6]
+    then error "Invalid compression setting parameter"
+    else return ()
+
 class Compress a b where
-  compress :: a -> b
+  compressWith :: a -> CompressionSettings -> b
+
+compress :: Compress a b => a -> b
+compress a = compressWith a defaultCompressionSettings
 
 instance Compress B.ByteString B.ByteString where
-  compress b = unsafePerformIO $ bracket I.createEncoder I.destroyEncoder $ \inst -> do
+  compressWith b CompressionSettings{..} = unsafePerformIO $ do
     let estBufSize = fromIntegral $ I.maxCompressedSize $ fromIntegral $ B.length b
     res <- alloca $ \outSize -> do
       poke outSize estBufSize
       BI.createAndTrim (fromIntegral estBufSize) $ \outBuf -> B.unsafeUseAsCStringLen b $ \(inPtr, inLen) -> do
 
-        ok <- I.encoderCompress I.defaultQuality I.defaultWindow I.defaultMode (fromIntegral inLen) (castPtr inPtr) outSize outBuf
+        ok <- I.encoderCompress (fromIntegral compressionQuality) (fromIntegral compressionWindow) compressionMode (fromIntegral inLen) (castPtr inPtr) outSize outBuf
         os <- peek outSize
         if (ok /= 1)
           then error "Compression error or output buffer is too small"
@@ -62,36 +101,48 @@ data FeedResponse = FeedResponse
   , totalProduced :: !Int
   } deriving (Show)
 
-stream :: I.BrotliEncoderState -> B.ByteString -> IO FeedResponse
-stream st bs = alloca $ \availableIn -> alloca $ \nextInP -> alloca $ \availableOut -> alloca $ \nextOutP -> alloca $ \totalOut -> B.unsafeUseAsCStringLen bs $ \(bsP, len) -> do
+data StreamVars = StreamVars
+  { availableIn :: !(Ptr CSize)
+  , nextIn :: !(Ptr (Ptr Word8))
+  , availableOut :: !(Ptr CSize)
+  , nextOut :: !(Ptr (Ptr Word8))
+  , totalOut :: !(Ptr CSize)
+  , outBuffer :: !(Ptr Word8)
+  }
+
+stream :: I.BrotliEncoderState -> StreamVars -> Int -> B.ByteString -> IO FeedResponse
+stream st StreamVars{..} bufSize bs = B.unsafeUseAsCStringLen bs $ \(bsP, len) -> do
   poke availableIn (fromIntegral len)
-  poke nextInP (castPtr bsP)
-  poke availableOut $ fromIntegral LI.smallChunkSize
-  outBs <- BI.createUptoN LI.smallChunkSize $ \outP -> do
-    poke nextOutP outP
-    res <- isTrue <$> I.encoderCompressStream st I.encoderOperationProcess availableIn nextInP availableOut nextOutP totalOut
-    unless res $ error "Unknown stream encoding failure"
+  poke nextIn (castPtr bsP)
+  poke availableOut $ fromIntegral bufSize
+  outBs <- BI.createUptoN bufSize $ \outP -> do
+    poke nextOut outP
+    res <- isTrue <$> I.encoderCompressStream st I.encoderOperationProcess availableIn nextIn availableOut nextOut totalOut
+    unless res $ do
+      free availableIn
+      free outBuffer
+      error "Unknown stream encoding failure"
     outCount <- peek availableOut
-    return $ LI.smallChunkSize - fromIntegral outCount
+    return $ bufSize - fromIntegral outCount
   unconsumedBytesCount <- peek availableIn
-  unconsumedBytesP <- peek nextInP
+  unconsumedBytesP <- peek nextIn
+  -- TODO don't copy bytestring if possible. Should be possible
   remainingInput <- B.packCStringLen (castPtr unconsumedBytesP, fromIntegral unconsumedBytesCount)
-  avail <- peek availableOut
   total <- fromIntegral <$> peek totalOut
   return $ FeedResponse remainingInput outBs total
 
 -- | Note that this should be called until returned bytestring is empty. Once is not enough.
-finishStream :: I.BrotliEncoderState -> IO (B.ByteString, Int)
-finishStream st = alloca $ \availableIn -> alloca $ \nextInP -> alloca $ \availableOut -> alloca $ \nextOutP -> alloca $ \totalOut -> do
+finishStream :: I.BrotliEncoderState -> StreamVars -> Int -> IO (B.ByteString, Int)
+finishStream st StreamVars{..} bufSize = do
   poke availableIn 0
-  poke nextInP nullPtr
-  poke availableOut $ fromIntegral LI.smallChunkSize
-  outBs <- BI.createUptoN LI.smallChunkSize $ \outP -> do
-    poke nextOutP outP
-    res <- isTrue <$> I.encoderCompressStream st I.encoderOperationFinish availableIn nextInP availableOut nextOutP totalOut
+  poke nextIn nullPtr
+  poke availableOut $ fromIntegral bufSize
+  outBs <- BI.createUptoN bufSize $ \outP -> do
+    poke nextOut outP
+    res <- isTrue <$> I.encoderCompressStream st I.encoderOperationFinish availableIn nextIn availableOut nextOut totalOut
     unless res $ error "Unknown stream encoding failure"
     outCount <- peek availableOut
-    return $ LI.smallChunkSize - fromIntegral outCount
+    return $ bufSize - fromIntegral outCount
   total <- fromIntegral <$> peek totalOut
   return (outBs, total)
 
@@ -104,43 +155,40 @@ consume st = do
     then Just <$> takeOutput st
     else return Nothing
 -}
+pOff :: Int -> Ptr a -> Ptr b
+pOff n p = castPtr $ plusPtr p (n * sizeOf p)
 
--- TODO properly finalize encoder
+pushNoCheck :: B.ByteString -> L.ByteString -> L.ByteString
+pushNoCheck = LI.Chunk
+
+-- TODO properly finalize encoder, malloc'ed buffers in the event of exceptions
 instance Compress L.ByteString L.ByteString where
-  compress b = unsafePerformIO $ do
+  compressWith b settings = unsafePerformIO $ do
     inst <- I.createEncoder
-    lazyCompress inst B.empty b
+    setCompressionSettings inst settings
+    bs <- mallocBytes (5 * sizeOf (nullPtr :: Ptr ()))
+    outBuf <- mallocBytes $ compressionBufferSize settings
+    let vars = StreamVars (castPtr bs) (pOff 1 bs) (pOff 2 bs) (pOff 3 bs) (pOff 4 bs) outBuf
+    lazyCompress inst vars b
     where
-      lazyCompress st previous c = unsafeInterleaveIO $ readChunks st previous c
-      lazyFinish st = unsafeInterleaveIO $ do
-        putStrLn "Demanding compressed finish chunk"
-        (res, _) <- finishStream st
+      lazyCompress st vars c = unsafeInterleaveIO $ readChunks st vars c
+      lazyFinish st vars = unsafeInterleaveIO $ do
+        (res, _) <- finishStream st vars $ compressionBufferSize settings
         if B.null res
-          then return LI.Empty
+          then free (availableIn vars) >> free (outBuffer vars) >> return L.empty
           else do
-            cs <- lazyFinish st
-            return $ LI.Chunk res cs
-      -- TODO previous can be replaced with raw ptr?
-      readChunks st previous c = do
-        putStrLn "Demanding compressed chunk"
-        if B.null previous
-          then case c of
-            LI.Chunk bs next -> do
-              fr <- stream st bs
-              if B.null $ availableOutput fr
-                then lazyCompress st (unusedInput fr) next
-                else do
-                  rest <- lazyCompress st (unusedInput fr) next
-                  return $ LI.Chunk (availableOutput fr) rest
-            LI.Empty -> lazyFinish st
-          else do
-            fr <- stream st previous
+            cs <- lazyFinish st vars
+            return $ pushNoCheck res cs
+      readChunks st vars c = do
+        case c of
+          LI.Chunk bs next -> do
+            fr <- stream st vars (compressionBufferSize settings) bs
             if B.null $ availableOutput fr
-              then lazyCompress st (unusedInput fr) c
+              then lazyCompress st vars $ LI.chunk (unusedInput fr) next
               else do
-                rest <- lazyCompress st (unusedInput fr) c
-                return $ LI.Chunk (availableOutput fr) rest
-
+                rest <- lazyCompress st vars $ LI.chunk (unusedInput fr) next
+                return $ pushNoCheck (availableOutput fr) rest
+          LI.Empty -> lazyFinish st vars
 {-
 instance Decompress B.ByteString B.ByteString where
   decompress b = unsafePerformIO $ alloca $ \outBufSizeP -> do
@@ -173,7 +221,6 @@ decompressWith b _ = unsafePerformIO $ do
   where
     lazyDecompress st rest = unsafeInterleaveIO $ writeChunks st rest
     writeChunks st lbs = do
-      putStrLn "Demanding decompressed chunk"
       case lbs of
         LI.Chunk bs rest -> alloca $ \inputLenP -> alloca $ \inputP -> alloca $ \outputLen -> alloca $ \outputPtr -> do
           all@(res, unconsumed', decompressed) <- B.unsafeUseAsCStringLen bs $ \(strP, strLen) -> do
@@ -193,23 +240,26 @@ decompressWith b _ = unsafePerformIO $ do
             1 -> do
               I.destroyDecoder st
               return $ if B.null decompressed
-                then LI.Empty
-                else LI.Chunk decompressed LI.Empty
+                then L.empty
+                else LI.chunk decompressed L.empty
             2 -> do -- Needs more input
               restOutput <- lazyDecompress st $ if B.null unconsumed'
                 then rest
-                else LI.Chunk unconsumed' rest
+                else LI.chunk unconsumed' rest
               return $ if B.null decompressed
                 then restOutput
-                else LI.Chunk decompressed restOutput
+                else LI.chunk decompressed restOutput
             3 -> do -- Needs more output
               -- Note that unconsumed here is always empty, but we feed an empty chunk
               -- in order to force as much consumption as needed before moving on.
+              -- This technically breaks the invariants of normal bytestring usage,
+              -- but this intermediate step isn't used outside of the function or
+              -- fed into any other bytestring functions.
               restOutput <- lazyDecompress st $ LI.Chunk unconsumed' rest
-              return $ LI.Chunk decompressed restOutput
+              return $ LI.chunk decompressed restOutput
             _ -> do -- Failure
               I.destroyDecoder st
               error "Encountered an error"
         LI.Empty -> do
           I.destroyDecoder st
-          return LI.Empty
+          return L.empty
