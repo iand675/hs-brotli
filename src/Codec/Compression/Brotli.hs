@@ -2,9 +2,10 @@
 {-# LANGUAGE MultiParamTypeClasses  #-}
 {-# LANGUAGE MagicHash              #-}
 {-# LANGUAGE RecordWildCards        #-}
+{-# LANGUAGE ScopedTypeVariables    #-}
 module Codec.Compression.Brotli where
 import Control.Monad (when, unless, forM)
-import Control.Exception (bracket)
+import Control.Exception (SomeException, handle, bracket, throw)
 import qualified Codec.Compression.Brotli.Internal as I
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as B
@@ -95,44 +96,43 @@ takeOutput st = alloca $ \sizeP -> do
   takeSize <- peek sizeP
   B.packCStringLen (castPtr ptr, fromIntegral takeSize)
 
-data FeedResponse = FeedResponse
-  { unusedInput :: !B.ByteString
-  , availableOutput :: !B.ByteString
-  , totalProduced :: !Int
-  } deriving (Show)
-
 data StreamVars = StreamVars
   { availableIn :: !(Ptr CSize)
   , nextIn :: !(Ptr (Ptr Word8))
   , availableOut :: !(Ptr CSize)
   , nextOut :: !(Ptr (Ptr Word8))
   , totalOut :: !(Ptr CSize)
-  , outBuffer :: !(Ptr Word8)
   }
 
-stream :: I.BrotliEncoderState -> StreamVars -> Int -> B.ByteString -> IO FeedResponse
-stream st StreamVars{..} bufSize bs = B.unsafeUseAsCStringLen bs $ \(bsP, len) -> do
+
+freeStreamVars :: StreamVars -> IO ()
+freeStreamVars = free . availableIn
+
+data StreamResponse = StreamResponse
+  { pendingInput :: !B.ByteString
+  , output :: !B.ByteString
+  }
+
+stream :: I.BrotliEncoderState -> StreamVars -> Int -> B.ByteString -> IO StreamResponse
+stream st vs@StreamVars{..} bufSize bs = B.unsafeUseAsCStringLen bs $ \(bsP, len) -> do
   poke availableIn (fromIntegral len)
   poke nextIn (castPtr bsP)
   poke availableOut $ fromIntegral bufSize
   outBs <- BI.createUptoN bufSize $ \outP -> do
     poke nextOut outP
     res <- isTrue <$> I.encoderCompressStream st I.encoderOperationProcess availableIn nextIn availableOut nextOut totalOut
-    unless res $ do
-      free availableIn
-      free outBuffer
-      error "Unknown stream encoding failure"
+    unless res $ error "Unknown stream encoding failure"
     outCount <- peek availableOut
     return $ bufSize - fromIntegral outCount
   unconsumedBytesCount <- peek availableIn
   unconsumedBytesP <- peek nextIn
-  -- TODO don't copy bytestring if possible. Should be possible
-  remainingInput <- B.packCStringLen (castPtr unconsumedBytesP, fromIntegral unconsumedBytesCount)
-  total <- fromIntegral <$> peek totalOut
-  return $ FeedResponse remainingInput outBs total
+  unusedInput <- if unconsumedBytesCount == 0
+    then return B.empty
+    else B.packCStringLen (castPtr unconsumedBytesP, fromIntegral unconsumedBytesCount)
+  return $ StreamResponse unusedInput outBs
 
 -- | Note that this should be called until returned bytestring is empty. Once is not enough.
-finishStream :: I.BrotliEncoderState -> StreamVars -> Int -> IO (B.ByteString, Int)
+finishStream :: I.BrotliEncoderState -> StreamVars -> Int -> IO B.ByteString
 finishStream st StreamVars{..} bufSize = do
   poke availableIn 0
   poke nextIn nullPtr
@@ -143,8 +143,7 @@ finishStream st StreamVars{..} bufSize = do
     unless res $ error "Unknown stream encoding failure"
     outCount <- peek availableOut
     return $ bufSize - fromIntegral outCount
-  total <- fromIntegral <$> peek totalOut
-  return (outBs, total)
+  return outBs
 
 
 {-
@@ -161,33 +160,28 @@ pOff n p = castPtr $ plusPtr p (n * sizeOf p)
 pushNoCheck :: B.ByteString -> L.ByteString -> L.ByteString
 pushNoCheck = LI.Chunk
 
--- TODO properly finalize encoder, malloc'ed buffers in the event of exceptions
 instance Compress L.ByteString L.ByteString where
   compressWith b settings = unsafePerformIO $ do
     inst <- I.createEncoder
     setCompressionSettings inst settings
     bs <- mallocBytes (5 * sizeOf (nullPtr :: Ptr ()))
-    outBuf <- mallocBytes $ compressionBufferSize settings
-    let vars = StreamVars (castPtr bs) (pOff 1 bs) (pOff 2 bs) (pOff 3 bs) (pOff 4 bs) outBuf
+    let vars = StreamVars (castPtr bs) (pOff 1 bs) (pOff 2 bs) (pOff 3 bs) (pOff 4 bs)
     lazyCompress inst vars b
     where
       lazyCompress st vars c = unsafeInterleaveIO $ readChunks st vars c
-      lazyFinish st vars = unsafeInterleaveIO $ do
-        (res, _) <- finishStream st vars $ compressionBufferSize settings
+      lazyFinish st vars = unsafeInterleaveIO $ handle (\(e :: SomeException) -> freeStreamVars vars >> I.destroyEncoder st >> throw e) $ do
+        res <- finishStream st vars $ compressionBufferSize settings
         if B.null res
-          then free (availableIn vars) >> free (outBuffer vars) >> return L.empty
+          then freeStreamVars vars >> return L.empty
           else do
             cs <- lazyFinish st vars
             return $ pushNoCheck res cs
       readChunks st vars c = do
         case c of
-          LI.Chunk bs next -> do
-            fr <- stream st vars (compressionBufferSize settings) bs
-            if B.null $ availableOutput fr
-              then lazyCompress st vars $ LI.chunk (unusedInput fr) next
-              else do
-                rest <- lazyCompress st vars $ LI.chunk (unusedInput fr) next
-                return $ pushNoCheck (availableOutput fr) rest
+          LI.Chunk bs next -> handle (\(e :: SomeException) -> freeStreamVars vars >> I.destroyEncoder st >> throw e) $ do
+            (StreamResponse unusedInput output) <- stream st vars (compressionBufferSize settings) bs
+            rest <- lazyCompress st vars $ LI.chunk unusedInput next
+            return $ LI.chunk output rest
           LI.Empty -> lazyFinish st vars
 {-
 instance Decompress B.ByteString B.ByteString where
@@ -255,7 +249,7 @@ decompressWith b _ = unsafePerformIO $ do
               -- This technically breaks the invariants of normal bytestring usage,
               -- but this intermediate step isn't used outside of the function or
               -- fed into any other bytestring functions.
-              restOutput <- lazyDecompress st $ LI.Chunk unconsumed' rest
+              restOutput <- lazyDecompress st $ pushNoCheck unconsumed' rest
               return $ LI.chunk decompressed restOutput
             _ -> do -- Failure
               I.destroyDecoder st
