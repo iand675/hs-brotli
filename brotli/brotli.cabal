@@ -18,6 +18,7 @@ library
   exposed-modules:     Codec.Compression.Brotli,
                        Codec.Compression.Brotli.Internal
   build-depends:       base >= 4.7 && < 5, ghc-prim, bytestring
+  extra-libraries:     brotlidec, brotlienc
   pkgconfig-depends:   libbrotlidec, libbrotlienc
   default-language:    Haskell2010
 
