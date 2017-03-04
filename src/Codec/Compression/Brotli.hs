@@ -108,42 +108,56 @@ data StreamVars = StreamVars
 freeStreamVars :: StreamVars -> IO ()
 freeStreamVars = free . availableIn
 
-data StreamResponse = StreamResponse
-  { pendingInput :: !B.ByteString
-  , output :: !B.ByteString
+createStreamVars :: IO StreamVars
+createStreamVars = do
+  bs <- mallocBytes (5 * sizeOf (nullPtr :: Ptr ()))
+  return $ StreamVars (castPtr bs) (pOff 1 bs) (pOff 2 bs) (pOff 3 bs) (pOff 4 bs)
+
+newtype EncoderFeedResponse = EncoderFeedResponse
+  { pendingInput :: B.ByteString
   }
 
-stream :: I.BrotliEncoderState -> StreamVars -> Int -> B.ByteString -> IO StreamResponse
-stream st vs@StreamVars{..} bufSize bs = B.unsafeUseAsCStringLen bs $ \(bsP, len) -> do
+feedEncoder :: I.BrotliEncoderState -> StreamVars -> Int -> B.ByteString -> IO EncoderFeedResponse
+feedEncoder st vs@StreamVars{..} bufSize bs = B.unsafeUseAsCStringLen bs $ \(bsP, len) -> do
   poke availableIn (fromIntegral len)
   poke nextIn (castPtr bsP)
-  poke availableOut $ fromIntegral bufSize
-  outBs <- BI.createUptoN bufSize $ \outP -> do
-    poke nextOut outP
-    res <- isTrue <$> I.encoderCompressStream st I.encoderOperationProcess availableIn nextIn availableOut nextOut totalOut
-    unless res $ error "Unknown stream encoding failure"
-    outCount <- peek availableOut
-    return $ bufSize - fromIntegral outCount
+  res <- isTrue <$> I.encoderCompressStream st I.encoderOperationProcess availableIn nextIn availableOut nextOut totalOut
+  unless res $ error "Unknown stream encoding failure"
   unconsumedBytesCount <- peek availableIn
   unconsumedBytesP <- peek nextIn
   unusedInput <- if unconsumedBytesCount == 0
     then return B.empty
     else B.packCStringLen (castPtr unconsumedBytesP, fromIntegral unconsumedBytesCount)
-  return $ StreamResponse unusedInput outBs
+  return $ EncoderFeedResponse unusedInput
+
+encoderMaybeTakeOutput :: I.BrotliEncoderState -> Int -> IO (Maybe B.ByteString)
+encoderMaybeTakeOutput st bufSize = do
+  takeOut <- isTrue <$> I.encoderHasMoreOutput st
+  if takeOut
+    then alloca $ \s -> do
+      poke s $ fromIntegral bufSize
+      bsp <- I.encoderTakeOutput st s
+      len <- peek s
+      Just <$> B.packCStringLen (castPtr bsp, fromIntegral len)
+    else return Nothing
+
+encoderTakeRestAvailable :: I.BrotliEncoderState -> IO () -> Int -> L.ByteString -> IO L.ByteString
+encoderTakeRestAvailable st cleanup bufSize graft = do
+  out <- encoderMaybeTakeOutput st bufSize
+  case out of
+    Nothing -> return graft
+    Just bs -> do
+      rest <- unsafeInterleaveIO $ encoderTakeRestAvailable st cleanup bufSize graft
+      return $ LI.Chunk bs rest
 
 -- | Note that this should be called until returned bytestring is empty. Once is not enough.
-finishStream :: I.BrotliEncoderState -> StreamVars -> Int -> IO B.ByteString
-finishStream st StreamVars{..} bufSize = do
+finishStream :: I.BrotliEncoderState -> StreamVars -> IO () -> Int -> IO L.ByteString
+finishStream st StreamVars{..} cleanup bufSize = do
   poke availableIn 0
   poke nextIn nullPtr
-  poke availableOut $ fromIntegral bufSize
-  outBs <- BI.createUptoN bufSize $ \outP -> do
-    poke nextOut outP
-    res <- isTrue <$> I.encoderCompressStream st I.encoderOperationFinish availableIn nextIn availableOut nextOut totalOut
-    unless res $ error "Unknown stream encoding failure"
-    outCount <- peek availableOut
-    return $ bufSize - fromIntegral outCount
-  return outBs
+  res <- isTrue <$> I.encoderCompressStream st I.encoderOperationFinish availableIn nextIn availableOut nextOut totalOut
+  unless res $ error "Unknown stream encoding failure"
+  encoderTakeRestAvailable st cleanup bufSize L.empty
 
 
 {-
@@ -164,25 +178,20 @@ instance Compress L.ByteString L.ByteString where
   compressWith b settings = unsafePerformIO $ do
     inst <- I.createEncoder
     setCompressionSettings inst settings
-    bs <- mallocBytes (5 * sizeOf (nullPtr :: Ptr ()))
-    let vars = StreamVars (castPtr bs) (pOff 1 bs) (pOff 2 bs) (pOff 3 bs) (pOff 4 bs)
-    lazyCompress inst vars b
+    vars <- createStreamVars
+    poke (availableOut vars) 0
+    poke (nextOut vars) nullPtr
+    let cleanup = freeStreamVars vars >> I.destroyEncoder inst
+    lazyCompress cleanup inst vars b
     where
-      lazyCompress st vars c = unsafeInterleaveIO $ readChunks st vars c
-      lazyFinish st vars = unsafeInterleaveIO $ handle (\(e :: SomeException) -> freeStreamVars vars >> I.destroyEncoder st >> throw e) $ do
-        res <- finishStream st vars $ compressionBufferSize settings
-        if B.null res
-          then freeStreamVars vars >> return L.empty
-          else do
-            cs <- lazyFinish st vars
-            return $ pushNoCheck res cs
-      readChunks st vars c = do
+      lazyCompress cleanup st vars c = unsafeInterleaveIO $ readChunks cleanup st vars c
+      readChunks cleanup st vars c = do
         case c of
-          LI.Chunk bs next -> handle (\(e :: SomeException) -> freeStreamVars vars >> I.destroyEncoder st >> throw e) $ do
-            (StreamResponse unusedInput output) <- stream st vars (compressionBufferSize settings) bs
-            rest <- lazyCompress st vars $ LI.chunk unusedInput next
-            return $ LI.chunk output rest
-          LI.Empty -> lazyFinish st vars
+          LI.Chunk bs next -> handle (\(e :: SomeException) -> cleanup >> throw e) $ do
+            (EncoderFeedResponse unusedInput) <- feedEncoder st vars (compressionBufferSize settings) bs
+            rest <- lazyCompress cleanup st vars $ LI.chunk unusedInput next
+            encoderTakeRestAvailable st cleanup (compressionBufferSize settings) rest
+          LI.Empty -> finishStream st vars (freeStreamVars vars >> I.destroyEncoder st) $ compressionBufferSize settings
 {-
 instance Decompress B.ByteString B.ByteString where
   decompress b = unsafePerformIO $ alloca $ \outBufSizeP -> do
@@ -238,8 +247,9 @@ decompress b = unsafePerformIO $ do
             return (res, unconsumed')
           case I.decoderResult res of
             I.Success -> do
-              allTheRest <- takeRestAvailable st (I.destroyDecoder st >> destroyDecompressionVars vs) L.empty
-              return allTheRest
+              -- allTheRest <- takeRestAvailable st (I.destroyDecoder st >> destroyDecompressionVars vs) L.empty
+              -- return allTheRest
+              return L.empty
             I.NeedsMoreInput -> do
               lazyDecompress st vs $ LI.chunk unconsumed' rest
             I.NeedsMoreOutput -> do
@@ -247,32 +257,29 @@ decompress b = unsafePerformIO $ do
               -- this is intentional because we need one last empty string to trigger either success or error
               -- depending on whether the string shouldn't have ended there
               afterOut <- lazyDecompress st vs $ LI.Chunk unconsumed' rest
-              takeRestAvailable st (return ()) afterOut
+              decoderTakeRestAvailable st (return ()) afterOut
             I.DecoderError e -> I.destroyDecoder st >> throw e
         LI.Empty -> do
-          -- TODO empty is an error if the whole bytestring is empty
           I.destroyDecoder st
           destroyDecompressionVars vs
-          return L.empty
+          throw $ I.BrotliDecoderErrorCode 2
 
-maybeTakeOutput :: I.BrotliDecoderState -> IO (Maybe B.ByteString)
-maybeTakeOutput st = do
+decoderMaybeTakeOutput :: I.BrotliDecoderState -> IO (Maybe B.ByteString)
+decoderMaybeTakeOutput st = do
   takeIn <- isTrue <$> I.decoderHasMoreOutput st
   if takeIn
-    then do
-      (bsp, len) <- alloca $ \s -> do
-        poke s 0 -- TODO settings
-        bsp <- I.decoderTakeOutput st s
-        len <- peek s
-        return (bsp, len)
+    then alloca $ \s -> do
+      poke s 0 -- TODO settings
+      bsp <- I.decoderTakeOutput st s
+      len <- peek s
       Just <$> B.packCStringLen (castPtr bsp, fromIntegral len)
     else return Nothing
 
-takeRestAvailable :: I.BrotliDecoderState -> IO () -> L.ByteString -> IO L.ByteString
-takeRestAvailable st cleanup graft = do
-  out <- maybeTakeOutput st
+decoderTakeRestAvailable :: I.BrotliDecoderState -> IO () -> L.ByteString -> IO L.ByteString
+decoderTakeRestAvailable st cleanup graft = do
+  out <- decoderMaybeTakeOutput st
   case out of
     Nothing -> cleanup >> return graft
     Just bs -> do
-      rest <- unsafeInterleaveIO $ takeRestAvailable st cleanup graft
+      rest <- unsafeInterleaveIO $ decoderTakeRestAvailable st cleanup graft
       return $ LI.Chunk bs rest
