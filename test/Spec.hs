@@ -28,6 +28,7 @@ main = do
   sampleRoundTrip ""
   sampleRoundTrip "What you need is an eclipse. However being a tidally locked planet you're not going to have a moon, at least your people would have been idiots for settling on a tidally locked planet with a moon as it would be unstable as discussed in this question: "
   L.readFile "/usr/share/dict/words" >>= sampleRoundTrip
+  longReallyCompressable 
   {-
   needsOutputL
   let comped = compress f
@@ -58,8 +59,5 @@ sample = do
   destroyEncoder enc
   encoderVersion >>= print
 
-needsOutputL = print (L.length bs, L.length dbs)
-  where
-    bs = L.replicate (2 ^ 12) 0
-    cbs = (compress bs) :: L.ByteString
-    dbs = (decompress cbs) :: L.ByteString
+longReallyCompressable :: IO ()
+longReallyCompressable = sampleRoundTrip (L.replicate (2 ^ 22) 0)
