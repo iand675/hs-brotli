@@ -1,7 +1,12 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 module Codec.Compression.Brotli.Internal where
+import Control.Exception
+import Data.Typeable (Typeable(..))
 import Data.Word
 import Foreign.C
+import Foreign.Marshal
 import Foreign.Ptr
+import System.IO.Unsafe
 
 type BrotliAlloc a = FunPtr (Ptr a -> CSize -> IO (Ptr ()))
 type BrotliFree a = FunPtr (Ptr a -> Ptr () -> IO ())
@@ -127,7 +132,7 @@ foreign import ccall safe "BrotliDecoderDecompressStream" decoderDecompressStrea
   -> Ptr CSize
   -> Ptr (Ptr Word8)
   -> Ptr CSize
-  -> IO CInt -- TODO result proper value
+  -> IO BrotliDecoderErrorCode -- TODO result proper value
 
 foreign import ccall unsafe "BrotliDecoderSetCustomDictionary" decoderSetCustomDictionary
   :: BrotliDecoderState
@@ -152,12 +157,34 @@ foreign import ccall unsafe "BrotliDecoderIsFinished" decoderIsFinished
   :: BrotliDecoderState
   -> IO CInt
 
-foreign import ccall unsafe "BrotliDecoderGetError" decoderGetError
+newtype BrotliDecoderErrorCode = BrotliDecoderErrorCode CInt
+  deriving (Eq, Typeable)
+
+instance Show BrotliDecoderErrorCode where
+  show c = unsafePerformIO (decoderErrorString c >>= peekCString)
+
+instance Exception BrotliDecoderErrorCode
+
+data DecoderResult
+  = Success
+  | NeedsMoreInput
+  | NeedsMoreOutput
+  | DecoderError BrotliDecoderErrorCode
+
+decoderResult :: BrotliDecoderErrorCode -> DecoderResult
+decoderResult c@(BrotliDecoderErrorCode n) = case n of
+  1 -> Success
+  2 -> NeedsMoreInput
+  3 -> NeedsMoreOutput
+  _ -> DecoderError c
+{-# INLINE decoderResult #-}
+
+foreign import ccall unsafe "BrotliDecoderGetErrorCode" decoderGetError
   :: BrotliDecoderState
-  -> IO CInt -- TODO BrotliDecoderErrorCode
+  -> IO BrotliDecoderErrorCode
 
 foreign import ccall unsafe "BrotliDecoderErrorString" decoderErrorString
-  :: CInt -- BrotliDecoderErrorCode
+  :: BrotliDecoderErrorCode
   -> IO CString
 
 foreign import ccall unsafe "BrotliDecoderVersion" decoderVersion

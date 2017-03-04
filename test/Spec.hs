@@ -13,9 +13,6 @@ main :: IO ()
 main = do
   putStrLn ""
   {-
-  bs <- L.readFile "/usr/share/dict/words"
-  print $ (compressWith bs (defaultCompressionSettings { compressionQuality = 0 }) :: L.ByteString)
-
   quickCheck $ \bs ->
     let cbs = (compress (bs :: B.ByteString)) :: B.ByteString
         dbs = (decompress cbs) :: B.ByteString
@@ -25,6 +22,12 @@ main = do
     let cbs = (compress (bs :: L.ByteString)) :: L.ByteString
         dbs = (decompress cbs) :: L.ByteString
     in dbs == bs
+
+  sampleRoundTrip ";"
+  sampleRoundTrip "\139\NUL\128\SOH\NUL\ETX"
+  sampleRoundTrip ""
+  sampleRoundTrip "What you need is an eclipse. However being a tidally locked planet you're not going to have a moon, at least your people would have been idiots for settling on a tidally locked planet with a moon as it would be unstable as discussed in this question: "
+  L.readFile "/usr/share/dict/words" >>= sampleRoundTrip
   {-
   needsOutputL
   let comped = compress f
@@ -40,6 +43,11 @@ main = do
   print finish
   destroyEncoder enc
   -}
+
+sampleRoundTrip :: L.ByteString -> IO ()
+sampleRoundTrip l = do
+  let rt = decompress $ compress l
+  print (L.toStrict l == L.toStrict rt)
 
 sample :: IO ()
 sample = do

@@ -5,7 +5,7 @@
 {-# LANGUAGE ScopedTypeVariables    #-}
 module Codec.Compression.Brotli where
 import Control.Monad (when, unless, forM)
-import Control.Exception (SomeException, handle, bracket, throw)
+import Control.Exception (SomeException, assert, handle, bracket, throw)
 import qualified Codec.Compression.Brotli.Internal as I
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as B
@@ -200,60 +200,79 @@ instance Decompress B.ByteString B.ByteString where
       Just e -> error (show e)
 -}
 
-data DecompressParams = DecompressParams
+data DecompressionVars = DecompressionVars
+  { dAvailableInput :: !(Ptr CSize)
+  , dNextIn :: !(Ptr (Ptr Word8))
+  , dAvailableOut :: !(Ptr CSize)
+  , dNextOut :: !(Ptr (Ptr Word8))
+  , dTotalOut :: !(Ptr CSize)
+  }
 
-defaultDecompressParams :: DecompressParams
-defaultDecompressParams = DecompressParams
+createDecompressionVars :: IO DecompressionVars
+createDecompressionVars = do
+  bs <- mallocBytes (5 * sizeOf (nullPtr :: Ptr ()))
+  return $ DecompressionVars (castPtr bs) (pOff 1 bs) (pOff 2 bs) (pOff 3 bs) (pOff 4 bs)
+
+destroyDecompressionVars :: DecompressionVars -> IO ()
+destroyDecompressionVars = free . dAvailableInput
 
 decompress :: L.ByteString -> L.ByteString
-decompress = (flip decompressWith) defaultDecompressParams
-
-decompressWith :: L.ByteString -> DecompressParams -> L.ByteString
-decompressWith b _ = unsafePerformIO $ do
+decompress b = unsafePerformIO $ do
   st <- I.createDecoder
-  lazyDecompress st b
+  vs <- createDecompressionVars
+  poke (dAvailableOut vs) 0
+  poke (dNextOut vs) nullPtr
+  lazyDecompress st vs b
   where
-    lazyDecompress st rest = unsafeInterleaveIO $ writeChunks st rest
-    writeChunks st lbs = do
+    lazyDecompress st vs rest = unsafeInterleaveIO $ writeChunks st vs rest
+    writeChunks st vs@DecompressionVars{..} lbs = do
       case lbs of
-        LI.Chunk bs rest -> alloca $ \inputLenP -> alloca $ \inputP -> alloca $ \outputLen -> alloca $ \outputPtr -> do
-          all@(res, unconsumed', decompressed) <- B.unsafeUseAsCStringLen bs $ \(strP, strLen) -> do
-            poke inputLenP (fromIntegral strLen)
-            poke inputP (castPtr strP)
-            res <- newIORef 0
-            decompressed <- BI.createUptoN LI.smallChunkSize $ \outP -> do
-              poke outputLen (fromIntegral LI.smallChunkSize)
-              poke outputPtr (castPtr outP)
-              writeIORef res =<< I.decoderDecompressStream st inputLenP inputP outputLen outputPtr nullPtr
-              (\ol -> LI.smallChunkSize - fromIntegral ol) <$> peek outputLen
-            remainingInputBytes <- peek inputLenP
-            compressedBytesPtr <- peek inputP
+        LI.Chunk bs rest -> do
+          v@(res, unconsumed') <- B.unsafeUseAsCStringLen bs $ \(strP, strLen) -> do
+            poke dAvailableInput (fromIntegral strLen)
+            poke dNextIn (castPtr strP)
+            res <- I.decoderDecompressStream st dAvailableInput dNextIn dAvailableOut dNextOut dTotalOut
+            remainingInputBytes <- peek dAvailableInput
+            compressedBytesPtr <- peek dNextIn
             unconsumed' <- B.packCStringLen (castPtr compressedBytesPtr, fromIntegral remainingInputBytes)
-            (\result -> (result, unconsumed', decompressed)) <$> readIORef res
-          case res of
-            1 -> do
-              I.destroyDecoder st
-              return $ if B.null decompressed
-                then L.empty
-                else LI.chunk decompressed L.empty
-            2 -> do -- Needs more input
-              restOutput <- lazyDecompress st $ if B.null unconsumed'
-                then rest
-                else LI.chunk unconsumed' rest
-              return $ if B.null decompressed
-                then restOutput
-                else LI.chunk decompressed restOutput
-            3 -> do -- Needs more output
-              -- Note that unconsumed here is always empty, but we feed an empty chunk
-              -- in order to force as much consumption as needed before moving on.
-              -- This technically breaks the invariants of normal bytestring usage,
-              -- but this intermediate step isn't used outside of the function or
-              -- fed into any other bytestring functions.
-              restOutput <- lazyDecompress st $ pushNoCheck unconsumed' rest
-              return $ LI.chunk decompressed restOutput
-            _ -> do -- Failure
-              I.destroyDecoder st
-              error "Encountered an error"
+            return (res, unconsumed')
+          case I.decoderResult res of
+            I.Success -> do
+              allTheRest <- takeRestAvailable st (I.destroyDecoder st >> destroyDecompressionVars vs) L.empty
+              return allTheRest
+            I.NeedsMoreInput -> do
+              lazyDecompress st vs $ LI.chunk unconsumed' rest
+            I.NeedsMoreOutput -> do
+              -- Sneak invariant breaking here by pushing what is quite possibly an empty Chunk.
+              -- this is intentional because we need one last empty string to trigger either success or error
+              -- depending on whether the string shouldn't have ended there
+              afterOut <- lazyDecompress st vs $ LI.Chunk unconsumed' rest
+              takeRestAvailable st (return ()) afterOut
+            I.DecoderError e -> I.destroyDecoder st >> throw e
         LI.Empty -> do
+          -- TODO empty is an error if the whole bytestring is empty
           I.destroyDecoder st
+          destroyDecompressionVars vs
           return L.empty
+
+maybeTakeOutput :: I.BrotliDecoderState -> IO (Maybe B.ByteString)
+maybeTakeOutput st = do
+  takeIn <- isTrue <$> I.decoderHasMoreOutput st
+  if takeIn
+    then do
+      (bsp, len) <- alloca $ \s -> do
+        poke s 0 -- TODO settings
+        bsp <- I.decoderTakeOutput st s
+        len <- peek s
+        return (bsp, len)
+      Just <$> B.packCStringLen (castPtr bsp, fromIntegral len)
+    else return Nothing
+
+takeRestAvailable :: I.BrotliDecoderState -> IO () -> L.ByteString -> IO L.ByteString
+takeRestAvailable st cleanup graft = do
+  out <- maybeTakeOutput st
+  case out of
+    Nothing -> cleanup >> return graft
+    Just bs -> do
+      rest <- unsafeInterleaveIO $ takeRestAvailable st cleanup graft
+      return $ LI.Chunk bs rest
