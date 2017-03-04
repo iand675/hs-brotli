@@ -27,9 +27,7 @@ brotliEncodeMiddleware app req sendResponse = app req $ \res ->
     ResponseFile{} -> sendResponse res
     (ResponseBuilder status hs b) -> if isBrotliResp
       then do
-        putStrLn "Tryna encode"
         let compressedResp = compress $ toLazyByteString b
-        print compressedResp
         sendResponse $ responseLBS status ((hContentEncoding, "br") : hs) compressedResp
       else sendResponse res
     ResponseStream{} -> sendResponse res
