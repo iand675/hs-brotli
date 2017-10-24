@@ -189,6 +189,7 @@ instance Compress L.ByteString L.ByteString where
         case c of
           LI.Chunk bs next -> handle (\(e :: SomeException) -> cleanup >> throw e) $ do
             (EncoderFeedResponse unusedInput) <- feedEncoder st vars (compressionBufferSize settings) bs
+            -- NOTE: LI.chunk checks for empty string results so we don't have to worry about empty chunks ourselves.
             rest <- lazyCompress cleanup st vars $ LI.chunk unusedInput next
             encoderTakeRestAvailable st cleanup (compressionBufferSize settings) rest
           LI.Empty -> finishStream st vars (freeStreamVars vars >> I.destroyEncoder st) $ compressionBufferSize settings
@@ -283,3 +284,124 @@ decoderTakeRestAvailable st cleanup graft = do
     Just bs -> do
       rest <- unsafeInterleaveIO $ decoderTakeRestAvailable st cleanup graft
       return $ LI.Chunk bs rest
+
+data Compressor
+  = Produce B.ByteString (IO Compressor)
+  | Consume (B.ByteString -> IO Compressor)
+  | Error
+  | Done
+
+compressor :: CompressionSettings -> IO Compressor
+compressor settings = do
+  inst <- I.createEncoder
+  setCompressionSettings inst settings
+  vars <- createStreamVars
+  poke (availableOut vars) 0
+  poke (nextOut vars) nullPtr
+  go inst vars
+  where
+    -- TODO try to reuse pointers directly instead of going to and from bytestrings
+    -- on leftover inputs
+    go inst vars = return $ consume B.empty
+      where
+        consume :: B.ByteString -> Compressor
+        consume leftovers =
+          Consume $ \bs -> do
+            if B.null leftovers && B.null bs
+              then done
+              else do
+                (EncoderFeedResponse resp) <-
+                  feedEncoder
+                    inst
+                    vars
+                    (compressionBufferSize settings)
+                    (if B.null leftovers
+                       then bs
+                       else if B.null bs
+                            then leftovers
+                            else (leftovers `mappend` bs)) 
+                if B.null resp
+                  then return $ consume B.empty
+                  else produce resp
+        produce :: B.ByteString -> IO Compressor
+        produce leftovers = do
+          out <- encoderMaybeTakeOutput inst (compressionBufferSize settings)
+          case out of
+            Nothing -> return $ consume leftovers
+            Just str -> return $ Produce str (produce leftovers)
+        -- err = undefined
+        done :: IO Compressor
+        done = do
+          let StreamVars {..} = vars
+          poke availableIn 0
+          poke nextIn nullPtr
+          I.encoderCompressStream
+            inst
+            I.encoderOperationFinish
+            availableIn
+            nextIn
+            availableOut
+            nextOut
+            totalOut
+          done'
+        done' = do
+          out <- encoderMaybeTakeOutput inst (compressionBufferSize settings)
+          case out of
+            Nothing -> do
+              freeStreamVars vars
+              I.destroyEncoder inst
+              return Done
+            Just str -> return $ Produce str done'
+
+decompressor :: IO Compressor
+decompressor = do
+  st <- I.createDecoder
+  vs <- createDecompressionVars
+  poke (dAvailableOut vs) 0
+  poke (dNextOut vs) nullPtr
+  go st vs
+  where
+    go st vs@DecompressionVars {..} = return $ consume B.empty
+      where
+        consume :: B.ByteString -> Compressor
+        consume leftover =
+          Consume $ \bs -> do
+            v@(res, unconsumed') <-
+              B.unsafeUseAsCStringLen
+                (if B.null leftover
+                   then bs
+                   else if B.null bs
+                          then B.empty
+                          else leftover `mappend` bs) $ \(strP, strLen) -> do
+                poke dAvailableInput (fromIntegral strLen)
+                poke dNextIn (castPtr strP)
+                res <-
+                  I.decoderDecompressStream
+                    st
+                    dAvailableInput
+                    dNextIn
+                    dAvailableOut
+                    dNextOut
+                    dTotalOut
+                remainingInputBytes <- peek dAvailableInput
+                compressedBytesPtr <- peek dNextIn
+                unconsumed' <-
+                  B.packCStringLen
+                    ( castPtr compressedBytesPtr
+                    , fromIntegral remainingInputBytes)
+                return (res, unconsumed')
+            case I.decoderResult res of
+              I.Success -> done
+              I.NeedsMoreInput -> return $ consume B.empty
+              I.NeedsMoreOutput -> produce unconsumed'
+              I.DecoderError e -> err -- I.destroyDecoder st >> throw e
+        produce rem = do
+          out <- decoderMaybeTakeOutput st
+          case out of
+            Nothing -> return (consume rem)
+            Just bs -> return $ Produce bs (produce rem)
+        err = return Error
+        done = do
+          I.destroyDecoder st
+          destroyDecompressionVars vs
+          return Done
