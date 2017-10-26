@@ -33,6 +33,7 @@ executable wai-middleware-brotli-server
   build-depends:       base
                      , http-types
                      , warp
+                     , wai-extra
                      , wai-middleware-brotli
                      , wai
                      , wai-app-static
