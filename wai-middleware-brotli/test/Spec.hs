@@ -139,5 +139,64 @@ main = do
     _ -> error "Not what we expected"
   putStrLn ""
 
--- curl -H "Accept-Encoding: br" http://leviathan.local:9450 | bro --decompress
--- Should return Hello World etc.
+  putStrLn "Compress fallback response for responseRaw if appropriate: Pending"
+  putStrLn "Don't compress files if set to ignore: Pending"
+  onTheFlyFileCompressTest
+  precompressedTest
+  putStrLn "Create cached file versions in given folder if appropriate: Pending"
+
+  putStrLn "Support flushing compressed data: Pending"
+  putStrLn "Return appropriate error statuses for malformed compressed input: Pending"
+
+onTheFlyFileCompressTest :: IO ()
+onTheFlyFileCompressTest = do
+  let settings = defaultSettings { brotliFilesBehavior = BrotliCompress, brotliMinimumSize = 5 }
+  putStr "Perform on-the-fly compression of files if set to compress or requesting appropriate content range size: "
+  let app req respond =
+        respond $
+        responseFile
+          status200
+          [ ("Content-Type", "text/whatever")
+          ]
+          "test/sample.txt"
+          Nothing
+  var <- newEmptyMVar
+  (brotli' settings app)
+    (defaultRequest {requestHeaders = [("Accept-Encoding", "br")]})
+    (\resp -> do
+       putMVar var resp
+       return ResponseReceived)
+  resp <- takeMVar var
+  r <- newIORef mempty
+  case resp of
+    ResponseStream stats hs f -> do
+      f (\b -> modifyIORef r (<> b)) (return ())
+      b <- readIORef r
+      print (decompress (Builder.toLazyByteString b) == "Hello world")
+    _ -> error "Not what we expected"
+  putStrLn ""
+
+precompressedTest :: IO ()
+precompressedTest = do
+  let settings = defaultSettings { brotliFilesBehavior = BrotliPreCompressed BrotliIgnore }
+  putStr "Serve precomputed compressed files if appropriate & they exist: "
+  let app req respond =
+        respond $
+        responseFile
+          status200
+          [ ("Content-Type", "text/whatever")
+          ]
+          "test/words"
+          Nothing
+  var <- newEmptyMVar
+  (brotli' settings app)
+    (defaultRequest {requestHeaders = [("Accept-Encoding", "br")]})
+    (\resp -> do
+       putMVar var resp
+       return ResponseReceived)
+  resp <- takeMVar var
+  case resp of
+    ResponseFile stats hs fp Nothing -> do
+      print (fp == "test/words.br")
+    _ -> error "Not what we expected"
+  putStrLn ""

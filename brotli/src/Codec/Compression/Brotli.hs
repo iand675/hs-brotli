@@ -259,6 +259,7 @@ decompress b = unsafePerformIO $ do
               -- depending on whether the string shouldn't have ended there
               afterOut <- lazyDecompress st vs $ LI.Chunk unconsumed' rest
               decoderTakeRestAvailable st (return ()) afterOut
+            -- TODO need a safe version of decompress too
             I.DecoderError e -> I.destroyDecoder st >> throw e
         LI.Empty -> do
           I.destroyDecoder st

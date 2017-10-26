@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Network.Wai.Middleware.Brotli
   ( brotli
   , brotli'
@@ -9,6 +10,7 @@ module Network.Wai.Middleware.Brotli
   ) where
 
 import Codec.Compression.Brotli
+import Control.Exception
 import Control.Monad
 import Data.Binary.Builder (toLazyByteString, fromLazyByteString, fromByteString, Builder)
 import qualified Data.ByteString.Char8 as B
@@ -16,10 +18,14 @@ import qualified Data.ByteString.Lazy as L
 import Data.IORef
 import Data.Maybe
 import Data.Monoid
-import qualified Data.Trie as Trie
 import Network.HTTP.Types.Header
+import Network.HTTP.Types.Status
 import Network.Wai
 import Network.Wai.Internal
+import System.Directory
+import System.FilePath
+import System.IO
+import System.Posix
 
 data BrotliFiles
   = BrotliIgnore
@@ -29,7 +35,7 @@ data BrotliFiles
   deriving (Read, Eq, Show)
 
 data BrotliSettings = BrotliSettings
-  { brotliCompressionSettings :: !CompressionSettings
+  { brotliCompressionSettings :: Request -> Response -> CompressionSettings
   , brotliMinimumSize :: Int
   , brotliFilesBehavior :: BrotliFiles
   , brotliShouldCompress :: BrotliSettings -> Request -> Response -> Bool
@@ -61,27 +67,34 @@ checkMime settings ctb =
   any (\b -> b `B.isSuffixOf` ctb) (brotliMimeSuffixes settings)
 
 defaultSettings :: BrotliSettings
-defaultSettings = BrotliSettings defaultCompressionSettings 860 BrotliIgnore defaultShouldCompress
-  [ "text/"
-  , "application/json"
-  , "application/javascript"
-  , "application/x-javascript"
-  , "application/ecmascript"
-  , "application/xml"
-  , "application/x-font-ttf"
-  , "image/x-icon"
-  , "image/vnd.microsoft.icon"
-  , "application/vnd.ms-fontobject"
-  , "application/x-font-opentype"
-  , "application/x-font-truetype"
-  , "font/eot"
-  , "font/otf"
-  , "font/ttf"
-  , "font/opentype"
-  ]
-  [ "+json"
-  , "+xml"
-  ]
+defaultSettings =
+  BrotliSettings
+    (\_ resp ->
+       case resp of
+         ResponseFile _ _ _ _ ->
+           defaultCompressionSettings {compressionQuality = 11}
+         _ -> defaultCompressionSettings {compressionQuality = 4})
+    860
+    BrotliIgnore
+    defaultShouldCompress
+    [ "text/"
+    , "application/json"
+    , "application/javascript"
+    , "application/x-javascript"
+    , "application/ecmascript"
+    , "application/xml"
+    , "application/x-font-ttf"
+    , "image/x-icon"
+    , "image/vnd.microsoft.icon"
+    , "application/vnd.ms-fontobject"
+    , "application/x-font-opentype"
+    , "application/x-font-truetype"
+    , "font/eot"
+    , "font/otf"
+    , "font/ttf"
+    , "font/opentype"
+    ]
+    ["+json", "+xml"]
 
 
 pluckHeader :: HeaderName -> [Header] -> (Maybe B.ByteString, [Header])
@@ -150,7 +163,6 @@ brotli = brotli' defaultSettings
 
 brotli' :: BrotliSettings -> Middleware
 brotli' settings app req sendResponse = do
-  let shouldCompress = (brotliShouldCompress settings) settings req
   decodedReq <-
     decodeRequestBody $
     (reqWithoutBrotliAcceptEnc
@@ -158,52 +170,67 @@ brotli' settings app req sendResponse = do
          (hAcceptEncoding, B.intercalate ", " remainingReqEncs) :
          requestHeaders reqWithoutBrotliAcceptEnc
      })
-  -- TODO support caching files
   app decodedReq $ \res ->
-    case res of
-      ResponseFile status hs fp bp -> case brotliFilesBehavior settings of
-        BrotliIgnore -> sendResponse res
-      (ResponseBuilder status hs b) ->
-        if isBrotliResp && shouldCompress res
-          then do
-            let compressedResp =
-                  compressWith
-                    (toLazyByteString b)
-                    (brotliCompressionSettings settings)
-            sendResponse $
-              responseLBS
-                status
-                (addBrotliToContentEnc $ fixHeaders hs)
-                compressedResp
-          else sendResponse res
-      (ResponseStream status hs f) ->
-        if isBrotliResp && shouldCompress res
-        then sendResponse $
-          ResponseStream status (addBrotliToContentEnc $ fixHeaders hs) $ \send flush -> do
-            c <- compressor (brotliCompressionSettings settings)
-            ref <- newIORef (c, False)
-            f (compressSend send flush ref) (compressFlush ref)
-            (c', shouldFlush) <- readIORef ref
-            when shouldFlush flush
-            case c' of
-              Consume consumer -> consumer B.empty >>= finishStreaming send
-              Produce _ _ -> error "Shouldn't be producing right now"
-              Error -> error "Shouldn't be in an error state right now"
-              Done -> return ()
-        else sendResponse res
-      ResponseRaw {} -> sendResponse res
+    if isBrotliResp
+      then wrapResponse settings req res sendResponse
+      else sendResponse res
   where
     (mEncs, reqWithoutBrotliAcceptEnc) =
       case pluckHeader hAcceptEncoding $ requestHeaders req of
         (ms, hs) -> (ms, req {requestHeaders = hs})
-    addBrotliToContentEnc hs =
-      let (respEncs, hsWithoutBrotliEnc) = pluckHeader hContentEncoding hs
-      in ((hContentEncoding, maybe "br" (<> ", br") respEncs) :
-          hsWithoutBrotliEnc)
     (isBrotliResp, remainingReqEncs) =
       case mEncs of
         Nothing -> (False, [])
         Just ebs -> canUseReqEncoding $ splitCommas ebs
+
+-- TODO add to middleware
+fixHeaders :: [Header] -> [Header]
+fixHeaders = filter (\(k, _) -> k /= hContentLength)
+
+wrapResponse :: BrotliSettings -> Request -> Response -> (Response -> IO a) -> IO a
+wrapResponse settings req res sendResponse =
+  let shouldCompress = (brotliShouldCompress settings) settings req
+  in if shouldCompress res
+       then case res of
+              ResponseFile status hs fp bp ->
+                compressedFileResponse
+                  settings
+                  addBrotliToContentEnc
+                  req
+                  status
+                  hs
+                  fp
+                  bp
+                  sendResponse
+              ResponseBuilder status hs b -> do
+                let compressedResp =
+                      compressWith
+                        (toLazyByteString b)
+                        (brotliCompressionSettings settings req res)
+                sendResponse $
+                  responseLBS status (addBrotliToContentEnc hs) compressedResp
+              ResponseStream status hs f ->
+                sendResponse $
+                ResponseStream status (addBrotliToContentEnc hs) $ \send flush -> do
+                  c <- compressor (brotliCompressionSettings settings req res)
+                  ref <- newIORef (c, False)
+                  f (compressSend send flush ref) (compressFlush ref)
+                  (c', shouldFlush) <- readIORef ref
+                  when shouldFlush flush
+                  case c' of
+                    Consume consumer ->
+                      consumer B.empty >>= finishStreaming send
+                    Produce _ _ -> error "Shouldn't be producing right now"
+                    Error -> error "Shouldn't be in an error state right now"
+                    Done -> return ()
+              ResponseRaw act fallback -> sendResponse $ responseRaw act fallback
+       else sendResponse res
+  where
+    addBrotliToContentEnc hs =
+      let (respEncs, hsWithoutBrotliEnc) = pluckHeader hContentEncoding hs
+      in fixHeaders $
+         ((hContentEncoding, maybe "br" (<> ", br") respEncs) :
+          hsWithoutBrotliEnc)
     finishStreaming send c =
       case c of
         Consume _ -> error "Shouldn't be consuming right now"
@@ -211,11 +238,6 @@ brotli' settings app req sendResponse = do
           send (fromByteString b) >> next >>= finishStreaming send
         Error -> error "Encountered error while finishing stream"
         Done -> return ()
-    prefixTree = Trie.fromList $ zip (brotliMimePrefixes settings) (repeat ())
-
--- TODO add to middleware
-fixHeaders :: [Header] -> [Header]
-fixHeaders = filter (\(k, _) -> k /= hContentLength)
 
 compressSend :: (Builder -> IO ()) -> IO () -> IORef (Compressor, Bool) -> Builder -> IO ()
 compressSend innerSend innerFlush st bs = do
@@ -230,13 +252,91 @@ compressSend innerSend innerFlush st bs = do
           innerSend $ fromByteString b
           when shouldFlush $ innerFlush
           r <- n
-          writeIORef st (r, False)
+          writeIORef st (r, False
+                        )
         Consume consumer -> do
           r <- consumer bs
           writeIORef st (r, shouldFlush)
         Error -> error "Streaming send of response body failed in brotli compression phase"
         Done -> error "Should not be done compressing while still sending data. Did you send an empty bytestring?"
 
-
 compressFlush :: IORef (Compressor, Bool) -> IO ()
 compressFlush ref = modifyIORef ref $ \(c, b) -> (c, True)
+
+compressedFileResponse ::
+     BrotliSettings
+  -> (ResponseHeaders -> ResponseHeaders)
+  -> Request
+  -> Status
+  -> ResponseHeaders
+  -> FilePath
+  -> Maybe FilePart
+  -> (Response -> IO a)
+  -> IO a
+compressedFileResponse settings addBrotliHeaders req status hs p mfp sendResponse =
+  case mfp of
+    Nothing ->
+      case brotliFilesBehavior settings of
+        BrotliIgnore -> sendResponse $ responseFile status hs p Nothing
+        BrotliCompress -> do
+          size <- fileSize <$> getFileStatus p
+          if fromIntegral size >= brotliMinimumSize settings
+            then do
+              let (status', hs', f) =
+                    responseToStream $ responseFile status hs p Nothing
+              f $ \body ->
+                wrapResponse
+                  settings
+                  req
+                  (responseStream status' hs' body)
+                  sendResponse
+            else sendResponse $ responseFile status hs p Nothing
+        BrotliCacheFolder cachePath
+      -- TODO check file size here maybe
+         -> do
+          createDirectoryIfMissing True cachePath
+          let normalized = normalizeOriginalFile p <.> "br"
+              adjustedFile = (cachePath </> normalizeOriginalFile p <.> "br")
+          exists <- doesFileExist adjustedFile
+          when (not exists) $ do
+            (tmpPath, h) <- openBinaryTempFile cachePath ("XXXXX" ++ normalized)
+            (flip onException) (removeFile tmpPath) $ do
+              original <- L.readFile p
+              L.hPut h $ compressWith original (brotliCompressionSettings settings req (responseFile status hs p mfp))
+              hClose h
+              rename tmpPath adjustedFile
+          sendResponse $
+            responseFile status (addBrotliHeaders hs) adjustedFile Nothing
+        BrotliPreCompressed fallback -> do
+          let modifiedPath = p <.> "br"
+          exists <- doesFileExist modifiedPath
+          if exists
+            then sendResponse $
+                 responseFile status (addBrotliHeaders hs) modifiedPath Nothing
+            else compressedFileResponse
+                   (settings {brotliFilesBehavior = fallback})
+                   addBrotliHeaders
+                   req
+                   status
+                   hs
+                   p
+                   mfp
+                   sendResponse
+    _ -> do
+      let (status', hs', f) = responseToStream $ responseFile status hs p mfp
+      f $ \body -> do
+        wrapResponse settings req (responseStream status' hs' body) sendResponse
+ 
+normalizeOriginalFile :: FilePath -> FilePath
+normalizeOriginalFile file = map safe $ case file of
+  ('.':'/':rest) -> rest
+  full -> full
+  where
+    safe c
+        | 'A' <= c && c <= 'Z' = c
+        | 'a' <= c && c <= 'z' = c
+        | '0' <= c && c <= '9' = c
+    safe '-' = '-'
+    safe '_' = '_'
+    safe '.' = '.'
+    safe _ = '_'

@@ -24,8 +24,18 @@ library
                      , directory
                      , filepath
                      , binary
-                     , bytestring-trie
+                     , unix
   default-language:    Haskell2010
+
+executable wai-middleware-brotli-server
+  hs-source-dirs:      app
+  main-is:             Main.hs
+  build-depends:       base
+                     , http-types
+                     , warp
+                     , wai-middleware-brotli
+                     , wai
+                     , wai-app-static
 
 test-suite wai-middleware-brotli-test
   type:                exitcode-stdio-1.0
