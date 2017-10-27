@@ -62,8 +62,6 @@ foreign import ccall unsafe "BrotliEncoderSetParameter" encoderSetParameter
   -> IO CInt -- ^ Bool
 foreign import ccall unsafe "BrotliEncoderDestroyInstance" destroyEncoder :: BrotliEncoderState -> IO ()
 
-foreign import ccall unsafe "BrotliEncoderSetCustomDictionary" encoderSetCustomDictionary :: BrotliEncoderState -> CSize -> Ptr Word8 -> IO ()
-
 foreign import ccall unsafe "BrotliEncoderMaxCompressedSize" maxCompressedSize :: CSize -> CSize
 
 foreign import ccall safe "BrotliEncoderCompress" encoderCompress
@@ -133,12 +131,6 @@ foreign import ccall safe "BrotliDecoderDecompressStream" decoderDecompressStrea
   -> Ptr (Ptr Word8)
   -> Ptr CSize
   -> IO BrotliDecoderErrorCode -- TODO result proper value
-
-foreign import ccall unsafe "BrotliDecoderSetCustomDictionary" decoderSetCustomDictionary
-  :: BrotliDecoderState
-  -> CSize
-  -> Ptr Word8
-  -> IO ()
 
 foreign import ccall unsafe "BrotliDecoderHasMoreOutput" decoderHasMoreOutput
   :: BrotliDecoderState
