@@ -1,8 +1,31 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+---------------------------------------------------------
+-- |
+-- Module        : Network.Wai.Middleware.Brotli
+-- Copyright     : Ian Duncan
+-- License       : BSD3
+--
+-- Maintainer    : Ian Duncan <ian@iankduncan.com>
+-- Stability     : Unstable
+-- Portability   : portable
+--
+-- Automatic brotli compression of responses.
+--
+-- If you are using this middleware with wai-extra's @gzip@ middleware,
+-- it is important that @brotli@ wraps your application before gzip does
+-- or your responses will be compressed by both, which is not beneficial.
+--
+-- Correct:
+--
+-- > gzip def . brotli defaultSettings
+--
+-- Incorrect:
+--
+-- > brotli defaultSettings . gzip def
+---------------------------------------------------------
 module Network.Wai.Middleware.Brotli
   ( brotli
-  , brotli'
   , defaultSettings
   , BrotliSettings(..)
   , defaultShouldCompress
@@ -28,10 +51,18 @@ import System.IO
 import System.Posix
 
 data BrotliFiles
-  = BrotliIgnore
+  = BrotliIgnore -- ^ Do not compress file responses
   | BrotliCompress
+    -- ^ Compress files on the fly. Note that this may counteract zero-copy
+    -- response optimizations on some platforms.
   | BrotliCacheFolder FilePath
+    -- ^ Compress files, caching them in the specified directory. Note that
+    -- changes to the original files will not invalidate existing cached files,
+    -- so it is important to clear the cache directory appropriately if the
+    -- original file has changed
   | BrotliPreCompressed BrotliFiles
+    -- ^ Look for the original file, only with the ".br" extension appended to it. Will fall back
+    -- to the provided file setting if the file doesn't exist.
   deriving (Read, Eq, Show)
 
 data BrotliSettings = BrotliSettings
@@ -43,6 +74,10 @@ data BrotliSettings = BrotliSettings
   , brotliMimeSuffixes :: [B.ByteString]
   }
 
+-- | It is recommended that you combine your custom logic around
+-- deciding to compress with this function, such as:
+--
+-- > \settings req resp -> defaultShouldCompress settings req resp && customPredicate
 defaultShouldCompress :: BrotliSettings -> Request -> Response -> Bool
 defaultShouldCompress settings req resp =
   let (mclb, hs) = pluckHeader hContentLength (responseHeaders resp)
@@ -66,6 +101,15 @@ checkMime settings ctb =
   any (\b -> b `B.isPrefixOf` ctb) (brotliMimePrefixes settings) ||
   any (\b -> b `B.isSuffixOf` ctb) (brotliMimeSuffixes settings)
 
+-- A sane set of starting defaults. Tuned to use faster / better compression
+-- than GZip defaults for non-file responses. Compresses most common text-based formats,
+-- skips compression on responses with known Content-Lengths that already fit
+-- within one TCP packet.
+--
+-- Note that this configuration does *not* compress file responses. Customizing
+-- @brotliFilesBehavior@ will use brotli's maximum compression quality by default, which is
+-- quite slow (albeit achieves very good compression ratios). It is highly recommended that
+-- you have an appropriate caching strategy to avoid compression of files on each request.
 defaultSettings :: BrotliSettings
 defaultSettings =
   BrotliSettings
@@ -158,11 +202,12 @@ decodeRequestBody req = do
               return bs
             Error -> error "Brotli stream decoding error in request body"
 
-brotli :: Middleware
-brotli = brotli' defaultSettings
-
-brotli' :: BrotliSettings -> Middleware
-brotli' settings app req sendResponse = do
+-- | Use brotli to decompress request bodies & compress response bodies.
+--
+-- Analyzes the Accept-Encoding and Content-Type headers to determine if
+-- brotli is supported.
+brotli :: BrotliSettings -> Middleware
+brotli settings app req sendResponse = do
   decodedReq <-
     decodeRequestBody $
     (reqWithoutBrotliAcceptEnc
@@ -219,7 +264,7 @@ wrapResponse settings req res sendResponse =
                   when shouldFlush flush
                   case c' of
                     Consume consumer ->
-                      consumer B.empty >>= finishStreaming send
+                      consumer (Chunk B.empty) >>= finishStreaming send
                     Produce _ _ -> error "Shouldn't be producing right now"
                     Error -> error "Shouldn't be in an error state right now"
                     Done -> return ()
@@ -239,7 +284,7 @@ wrapResponse settings req res sendResponse =
         Error -> error "Encountered error while finishing stream"
         Done -> return ()
 
-compressSend :: (Builder -> IO ()) -> IO () -> IORef (Compressor, Bool) -> Builder -> IO ()
+compressSend :: (Builder -> IO ()) -> IO () -> IORef (BrotliStream Chunk, Bool) -> Builder -> IO ()
 compressSend innerSend innerFlush st bs = do
   let steps = L.toChunks $ toLazyByteString bs
   mapM_ (step st) steps
@@ -255,12 +300,12 @@ compressSend innerSend innerFlush st bs = do
           writeIORef st (r, False
                         )
         Consume consumer -> do
-          r <- consumer bs
+          r <- consumer $ Chunk bs
           writeIORef st (r, shouldFlush)
         Error -> error "Streaming send of response body failed in brotli compression phase"
         Done -> error "Should not be done compressing while still sending data. Did you send an empty bytestring?"
 
-compressFlush :: IORef (Compressor, Bool) -> IO ()
+compressFlush :: IORef (BrotliStream Chunk, Bool) -> IO ()
 compressFlush ref = modifyIORef ref $ \(c, b) -> (c, True)
 
 compressedFileResponse ::
@@ -326,11 +371,9 @@ compressedFileResponse settings addBrotliHeaders req status hs p mfp sendRespons
       let (status', hs', f) = responseToStream $ responseFile status hs p mfp
       f $ \body -> do
         wrapResponse settings req (responseStream status' hs' body) sendResponse
- 
+
 normalizeOriginalFile :: FilePath -> FilePath
-normalizeOriginalFile file = map safe $ case file of
-  ('.':'/':rest) -> rest
-  full -> full
+normalizeOriginalFile file = map safe file
   where
     safe c
         | 'A' <= c && c <= 'Z' = c
@@ -340,3 +383,4 @@ normalizeOriginalFile file = map safe $ case file of
     safe '_' = '_'
     safe '.' = '.'
     safe _ = '_'
+

@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+import Control.Concurrent
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
@@ -9,6 +10,9 @@ import Codec.Compression.Brotli.Internal
 import Test.QuickCheck
 import Test.QuickCheck.Instances
 
+fastSettings :: CompressionSettings
+fastSettings = defaultCompressionSettings { compressionQuality = 4 }
+
 main :: IO ()
 main = do
   putStrLn ""
@@ -18,8 +22,9 @@ main = do
         dbs = (decompress cbs) :: B.ByteString
     in dbs == bs
   -}
+
   quickCheck $ \bs ->
-    let cbs = (compress (bs :: L.ByteString)) :: L.ByteString
+    let cbs = (compressWith (bs :: L.ByteString) fastSettings) :: L.ByteString
         dbs = (decompress cbs) :: L.ByteString
     in dbs == bs
 
@@ -36,20 +41,29 @@ main = do
   -}
   -- print (compress str :: ByteString)
   -- print (compress lstr :: L.ByteString)
-  (Consume c) <- compressor defaultCompressionSettings
+  --
+  (Consume c) <- compressor fastSettings
   putStrLn "Got consumer"
-  let bs = B.replicate (2 ^ 8) 0
-  (Consume c') <- c bs
-  putStrLn "Still consuming"
-  (Produce r f) <- c' ""
-  putStrLn "Done, so should start producing"
-  Done <- f
+  -- bs <- B.readFile "/usr/share/dict/words" -- B.replicate (2 ^ 18) 0
+  putStrLn "Feed once"
+  (Consume c) <- c $ Chunk "Hello "
+  putStrLn "Flush"
+  (Produce compressedPt1 followup) <- c Flush
+  putStrLn "Got flush triggered produce"
+  (Consume c) <- followup
+  putStrLn "Back to consuming"
+  (Consume c) <- c $ Chunk "World"
+  putStrLn "Fed it some more"
+  (Produce compressedPt2 followup) <- c $ Chunk ""
+  putStrLn "Done, so should signal that now"
+  Done <- followup
   putStrLn "Yup, hit the end"
-  print (CL.fromStrict bs == decompress (CL.fromStrict r))
+  print ("Hello World" == decompress (CL.fromStrict (compressedPt1 `mappend` compressedPt2)))
+  -- threadDelay 10000000
 
 sampleRoundTrip :: L.ByteString -> IO ()
 sampleRoundTrip l = do
-  let rt = decompress $ compress l
+  let rt = decompress $ compressWith l fastSettings
   print (L.toStrict l == L.toStrict rt)
 
 sample :: IO ()

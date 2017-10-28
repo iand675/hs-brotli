@@ -8,10 +8,10 @@ import Control.Monad.Trans
 import Data.ByteString as B
 import Pipes
 
-compress :: MonadIO m => Pipe B.ByteString B.ByteString m ()
+compress :: MonadIO m => Pipe Chunk B.ByteString m ()
 compress = compress' defaultCompressionSettings
 
-compress' :: MonadIO m => CompressionSettings -> Pipe B.ByteString B.ByteString m ()
+compress' :: MonadIO m => CompressionSettings -> Pipe Chunk B.ByteString m ()
 compress' settings = do
   c <- liftIO $ compressor settings
   go c
@@ -22,8 +22,8 @@ compress' settings = do
         c' <- liftIO next
         go c'
       Consume f -> do
-        bs <- await
-        c' <- liftIO $ f bs
+        chunk <- await
+        c' <- liftIO $ f chunk
         go c'
       Error -> error "TODO"
       Done -> return ()

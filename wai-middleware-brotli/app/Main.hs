@@ -14,4 +14,4 @@ main = do
         B.defaultSettings
         {B.brotliFilesBehavior = B.BrotliPreCompressed (B.BrotliCacheFolder "."), B.brotliMinimumSize = 5}
       app = staticApp $ defaultFileServerSettings "."
-  runEnv 3000 (gzip def {- TODO replace gzip with zopfli -} $ B.brotli' settings {- $ sdch sdchSettings -} $ app)
+  runEnv 3000 (gzip def {- TODO replace gzip with zopfli -} $ B.brotli settings {- $ sdch sdchSettings -} $ app)

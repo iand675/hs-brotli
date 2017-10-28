@@ -25,8 +25,14 @@ defaultMode = encoderModeGeneric
 newtype BrotliEncoderMode = BrotliEncoderMode { fromBrotliEncoderMode :: CInt }
   deriving (Show)
 
+-- | Default compression mode.
+--
+-- In this mode compressor does not know anything in advance about the
+-- properties of the input.
 encoderModeGeneric = BrotliEncoderMode 0
+-- | Compression mode for UTF-8 formatted text input.
 encoderModeText = BrotliEncoderMode 1
+-- | Compression mode used in WOFF 2.0
 encoderModeFont = BrotliEncoderMode 2
 
 newtype BrotliEncoderState = BrotliEncoderState (Ptr BrotliEncoderState)
@@ -60,7 +66,11 @@ foreign import ccall unsafe "BrotliEncoderSetParameter" encoderSetParameter
   -> BrotliEncoderParameter
   -> Word32
   -> IO CInt -- ^ Bool
+
 foreign import ccall unsafe "BrotliEncoderDestroyInstance" destroyEncoder :: BrotliEncoderState -> IO ()
+
+foreign import ccall unsafe "&BrotliEncoderDestroyInstance" destroyEncoder_ptr :: FunPtr (Ptr BrotliEncoderState -> IO ())
+
 
 foreign import ccall unsafe "BrotliEncoderMaxCompressedSize" maxCompressedSize :: CSize -> CSize
 
@@ -115,6 +125,9 @@ createDecoder = brotliDecoderCreateInstance nullFunPtr nullFunPtr nullPtr
 foreign import ccall unsafe "BrotliDecoderDestroyInstance" destroyDecoder
   :: BrotliDecoderState
   -> IO ()
+
+foreign import ccall unsafe "&BrotliDecoderDestroyInstance" destroyDecoder_ptr
+  :: FunPtr (Ptr BrotliDecoderState -> IO ())
 
 foreign import ccall safe "BrotliDecoderDecompress" decoderDecompress
   :: CSize
