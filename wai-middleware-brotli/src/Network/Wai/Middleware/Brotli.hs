@@ -228,7 +228,6 @@ brotli settings app req sendResponse = do
         Nothing -> (False, [])
         Just ebs -> canUseReqEncoding $ splitCommas ebs
 
--- TODO add to middleware
 fixHeaders :: [Header] -> [Header]
 fixHeaders = filter (\(k, _) -> k /= hContentLength)
 
@@ -247,6 +246,7 @@ wrapResponse settings req res sendResponse =
                   fp
                   bp
                   sendResponse
+
               ResponseBuilder status hs b -> do
                 let compressedResp =
                       compressWith
@@ -254,21 +254,23 @@ wrapResponse settings req res sendResponse =
                         (brotliCompressionSettings settings req res)
                 sendResponse $
                   responseLBS status (addBrotliToContentEnc hs) compressedResp
+
               ResponseStream status hs f ->
                 sendResponse $
                 ResponseStream status (addBrotliToContentEnc hs) $ \send flush -> do
                   c <- compressor (brotliCompressionSettings settings req res)
-                  ref <- newIORef (c, False)
-                  f (compressSend send flush ref) (compressFlush ref)
-                  (c', shouldFlush) <- readIORef ref
-                  when shouldFlush flush
+                  ref <- newIORef c
+                  f (compressSend send flush ref) (compressFlush send flush ref)
+                  c' <- readIORef ref
                   case c' of
                     Consume consumer ->
                       consumer (Chunk B.empty) >>= finishStreaming send
                     Produce _ _ -> error "Shouldn't be producing right now"
                     Error -> error "Shouldn't be in an error state right now"
                     Done -> return ()
+
               ResponseRaw act fallback -> sendResponse $ responseRaw act fallback
+
        else sendResponse res
   where
     addBrotliToContentEnc hs =
@@ -284,29 +286,41 @@ wrapResponse settings req res sendResponse =
         Error -> error "Encountered error while finishing stream"
         Done -> return ()
 
-compressSend :: (Builder -> IO ()) -> IO () -> IORef (BrotliStream Chunk, Bool) -> Builder -> IO ()
+compressSend :: (Builder -> IO ()) -> IO () -> IORef (BrotliStream Chunk) -> Builder -> IO ()
 compressSend innerSend innerFlush st bs = do
   let steps = L.toChunks $ toLazyByteString bs
-  mapM_ (step st) steps
-  where
-    step st bs = do
-      -- TODO this needs to produce until a consume is hit
-      (c, shouldFlush) <- readIORef st
-      case c of
-        Produce b n -> do
-          innerSend $ fromByteString b
-          when shouldFlush $ innerFlush
-          r <- n
-          writeIORef st (r, False
-                        )
-        Consume consumer -> do
-          r <- consumer $ Chunk bs
-          writeIORef st (r, shouldFlush)
-        Error -> error "Streaming send of response body failed in brotli compression phase"
-        Done -> error "Should not be done compressing while still sending data. Did you send an empty bytestring?"
 
-compressFlush :: IORef (BrotliStream Chunk, Bool) -> IO ()
-compressFlush ref = modifyIORef ref $ \(c, b) -> (c, True)
+  action <- readIORef st
+  action' <- foldM step action steps
+  writeIORef st action'
+
+  where
+    step c bs = case c of
+      Produce b n -> do
+        innerSend $ fromByteString b
+        r <- n
+        step r bs
+      Consume consumer -> consumer $ Chunk bs
+      Error -> error "Streaming send of response body failed in brotli compression phase"
+      Done -> error "Should not be done compressing while still sending data. Did you send an empty bytestring?"
+
+performFlush :: (Builder -> IO ()) -> IO () -> BrotliStream Chunk -> IO (BrotliStream Chunk)
+performFlush innerSend innerFlush c = case c of
+  Consume consumer -> consumer Flush >>= performFlush'
+  _ -> error "Shouldn't be flushing value when not in consumption state"
+  where
+    performFlush' c = case c of
+      Produce b n -> do
+        innerSend $ fromByteString b
+        r <- n
+        performFlush' r
+      _ -> innerFlush >> pure c
+
+compressFlush :: (Builder -> IO ()) -> IO () -> IORef (BrotliStream Chunk) -> IO ()
+compressFlush innerSend innerFlush ref = do
+  action <- readIORef ref
+  r <- performFlush innerSend innerFlush action
+  writeIORef ref r
 
 compressedFileResponse ::
      BrotliSettings
