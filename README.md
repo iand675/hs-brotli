@@ -34,6 +34,19 @@ packages:
 
 ```
 
+You will also need to install the C library >= 0.6 in a location where
+pkg-config can find it. You can run `pkg-config --static --libs --cflags libbrotlienc` to see if it's installed appropriately.
+
+You can find the C library [here](https://github.com/google/brotli).
+
+Or install from your package manager:
+
+| Platform       | Installation Command     |
+|----------------|--------------------------|
+| MacOS          | `brew install brotli`    |
+| Ubuntu Xenial  | `apt-get install brotli` |
+
+
 ## Roadmap
 
 All of the base `brotli` package high level bindings are functional, but
