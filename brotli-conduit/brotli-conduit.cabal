@@ -2,7 +2,7 @@ name:                brotli-conduit
 version:             0.1.0.0
 -- synopsis:
 -- description:
-homepage:            https://github.com/iand675/brotli-conduit#readme
+homepage:            https://github.com/iand675/hs-brotli#readme
 license:             BSD3
 license-file:        LICENSE
 author:              Ian Duncan
@@ -17,7 +17,7 @@ library
   hs-source-dirs:      src
   exposed-modules:     Data.Conduit.Brotli
   build-depends:       base >= 4.7 && < 5,
-                       brotli,
+                       hs-brotli,
                        conduit,
                        mtl,
                        bytestring
