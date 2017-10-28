@@ -24,7 +24,7 @@ main = do
   -}
 
   quickCheck $ \bs ->
-    let cbs = (compressWith (bs :: L.ByteString) fastSettings) :: L.ByteString
+    let cbs = (compressWith fastSettings (bs :: L.ByteString)) :: L.ByteString
         dbs = (decompress cbs) :: L.ByteString
     in dbs == bs
 
@@ -63,7 +63,7 @@ main = do
 
 sampleRoundTrip :: L.ByteString -> IO ()
 sampleRoundTrip l = do
-  let rt = decompress $ compressWith l fastSettings
+  let rt = decompress $ compressWith fastSettings l
   print (L.toStrict l == L.toStrict rt)
 
 sample :: IO ()

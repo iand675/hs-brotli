@@ -57,6 +57,7 @@ data CompressionSettings = CompressionSettings
   , compressionSizeHint :: !(Maybe Word32)
   }
 
+-- | The default set of parameters for compression. This is typically used with the compressWith function with specific parameters overridden.
 defaultCompressionSettings :: CompressionSettings
 defaultCompressionSettings = CompressionSettings
   { compressionQuality = I.defaultQuality
@@ -80,14 +81,26 @@ setCompressionSettings st CompressionSettings{..}= do
     then error "Invalid compression setting parameter"
     else pure ()
 
+-- | Like compress but with the ability to specify various compression parameters. Typical usage:
+--
+-- > compressWith defaultCompressionSettings { ... }
+--
+-- In particular you can set the compression level:
+--
+-- > compressWith defaultCompressParams { compressionQuality = minQuality }
 class Compress a b where
-  compressWith :: a -> CompressionSettings -> b
+  compressWith :: CompressionSettings -> a-> b
 
+-- | Compress a stream of data into the brotli format.
+--
+-- This uses the default compression parameters. In particular it uses the highest compression level which favours a higher compression ratio over compression speed.
+--
+-- Use compressWith to adjust the compression level or other compression parameters.
 compress :: Compress a b => a -> b
-compress a = compressWith a defaultCompressionSettings
+compress = compressWith defaultCompressionSettings
 
 instance Compress B.ByteString B.ByteString where
-  compressWith b CompressionSettings{..} = unsafePerformIO $ do
+  compressWith CompressionSettings{..} b = unsafePerformIO $ do
     let estBufSize = fromIntegral $ I.maxCompressedSize $ fromIntegral $ B.length b
     res <- alloca $ \outSize -> do
       poke outSize estBufSize
@@ -212,7 +225,7 @@ pushNoCheck :: B.ByteString -> L.ByteString -> L.ByteString
 pushNoCheck = LI.Chunk
 
 instance Compress L.ByteString L.ByteString where
-  compressWith b settings = unsafePerformIO $ do
+  compressWith settings b = unsafePerformIO $ do
     inst <- I.createEncoder
     setCompressionSettings inst settings
     vars <- createStreamVars
@@ -252,6 +265,17 @@ createDecompressionVars = do
 destroyDecompressionVars :: DecompressionVars -> IO ()
 destroyDecompressionVars = free . dAvailableInput
 
+-- | Decompress a stream of data in the brotli format.
+--
+-- There are a number of errors that can occur. In each case an exception will
+-- be thrown.
+--
+-- Note that the decompression is performed /lazily/. Errors in the data stream
+-- may not be detected until the end of the stream is demanded (since it is
+-- only at the end that the final checksum can be checked). If this is
+-- important to you, you must make sure to consume the whole decompressed
+-- stream before doing any IO action that depends on it.
+--
 decompress :: L.ByteString -> L.ByteString
 decompress b = unsafePerformIO $ do
   st <- I.createDecoder
@@ -326,6 +350,9 @@ data BrotliStream input
 withEncoder :: ForeignPtr I.BrotliEncoderState -> (I.BrotliEncoderState -> IO a) -> IO a
 withEncoder p f = withForeignPtr p (f . I.BrotliEncoderState)
 
+-- | A strict, streaming compressor. This allows compressing
+-- values in constant memory in addition to giving fine-grained
+-- control of when to flush data in the stream.
 compressor :: CompressionSettings -> IO (BrotliStream Chunk)
 compressor settings = do
   (I.BrotliEncoderState encoder) <- I.createEncoder
@@ -439,6 +466,9 @@ compressor settings = do
               pure Done
             Just str -> pure $ Produce str done'
 
+-- | A strict, streaming decompressor. This allows decompressing
+-- values in constant memory as long as you don't need the full output
+-- at one time.
 decompressor :: IO (BrotliStream B.ByteString)
 decompressor = do
   st <- I.createDecoder

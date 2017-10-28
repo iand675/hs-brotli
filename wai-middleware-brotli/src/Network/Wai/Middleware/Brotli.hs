@@ -250,8 +250,8 @@ wrapResponse settings req res sendResponse =
               ResponseBuilder status hs b -> do
                 let compressedResp =
                       compressWith
-                        (toLazyByteString b)
                         (brotliCompressionSettings settings req res)
+                        (toLazyByteString b)
                 sendResponse $
                   responseLBS status (addBrotliToContentEnc hs) compressedResp
 
@@ -361,7 +361,7 @@ compressedFileResponse settings addBrotliHeaders req status hs p mfp sendRespons
             (tmpPath, h) <- openBinaryTempFile cachePath ("XXXXX" ++ normalized)
             (flip onException) (removeFile tmpPath) $ do
               original <- L.readFile p
-              L.hPut h $ compressWith original (brotliCompressionSettings settings req (responseFile status hs p mfp))
+              L.hPut h $ compressWith (brotliCompressionSettings settings req (responseFile status hs p mfp)) original 
               hClose h
               rename tmpPath adjustedFile
           sendResponse $
