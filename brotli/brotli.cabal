@@ -1,7 +1,16 @@
 name:                brotli
 version:             0.1.0.0
--- synopsis:
--- description:
+synopsis:            Compression and decompression in the brotli format
+description:         This package provides a pure interface for compressing and 
+                     decompressing streams of data represented as strict or lazy 
+                     'ByteString's. It uses the
+                     <https://en.wikipedia.org/wiki/Brotli brotli C library>
+                     so it has high performance. It supports the \"brotli\",
+                     compression format.
+                     .
+                     It provides a convenient high level API suitable for most
+                     tasks and for the few cases where more control is needed it
+                     provides access to the full brotli feature set
 homepage:            https://github.com/iand675/brotli#readme
 license:             BSD3
 license-file:        LICENSE
@@ -37,4 +46,4 @@ test-suite brotli-test
 
 source-repository head
   type:     git
-  location: https://github.com/iand675/brotli
+  location: https://github.com/iand675/hs-brotli

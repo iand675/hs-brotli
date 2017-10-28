@@ -58,4 +58,4 @@ test-suite wai-middleware-brotli-test
 
 source-repository head
   type:     git
-  location: https://github.com/iand675/wai-middleware-brotli
+  location: https://github.com/iand675/hs-brotli

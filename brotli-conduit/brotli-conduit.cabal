@@ -34,4 +34,4 @@ test-suite brotli-conduit-test
 
 source-repository head
   type:     git
-  location: https://github.com/iand675/brotli-conduit
+  location: https://github.com/iand675/hs-brotli

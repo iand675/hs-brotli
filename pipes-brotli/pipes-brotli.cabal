@@ -35,4 +35,4 @@ test-suite pipes-brotli-test
 
 source-repository head
   type:     git
-  location: https://github.com/iand675/pipes-brotli
+  location: https://github.com/iand675/hs-brotli
