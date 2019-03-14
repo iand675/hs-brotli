@@ -1,4 +1,4 @@
-# Brotli compression for Haskell
+# 🥦 Brotli compression for Haskell 🥦
 
 Brotli is a compression format that can achieve higher compression
 ratios and compress faster than gzip and deflate. It is supported
