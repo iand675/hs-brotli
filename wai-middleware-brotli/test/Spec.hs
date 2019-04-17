@@ -8,6 +8,7 @@ import qualified Data.ByteString.Lazy as L
 import qualified Data.ByteString.Builder as Builder
 import Data.IORef
 import Data.Monoid
+import Data.String
 import Network.Wai
 import Network.Wai.Middleware.Brotli
 import Network.Wai.Internal
@@ -16,12 +17,13 @@ import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.Hspec
 import System.IO
+import System.IO.Error
 
 main :: IO ()
 main = do
   putStrLn ""
 
-  bod <- L.readFile "/usr/share/dict/words" -- "Hello World 000000000000000000000000000000"
+  bod <- catchIOError (L.readFile "/usr/share/dict/words") (const . pure . fromString $ "Hello World " ++ replicate 860 '0')
   let app req respond = respond $ responseLBS status200 [("Content-Type", "text/whatever")] bod
 
   specs <- testSpecs $ parallel $ do
